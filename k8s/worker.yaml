@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: taskgrid-worker
+
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: taskgrid-worker
+
+  template:
+    metadata:
+      labels:
+        app: taskgrid-worker
+
+    spec:
+      containers:
+        - name: taskgrid-worker
+          image: taskgrid:latest
+          imagePullPolicy: Never
+
+          env:
+            - name: TASKGRID_MODE
+              value: "worker"
+
+            - name: REDIS_ADDR
+              value: "redis:6379"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi

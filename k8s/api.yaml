@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: taskgrid-api
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: taskgrid-api
+
+  template:
+    metadata:
+      labels:
+        app: taskgrid-api
+
+    spec:
+      containers:
+        - name: taskgrid-api
+          image: taskgrid:latest
+          imagePullPolicy: Never
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            - name: TASKGRID_MODE
+              value: "api"
+
+            - name: REDIS_ADDR
+              value: "redis:6379"
+
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taskgrid-ai
+                  key: GROQ_API_KEY
+              
+
+            - name: GROQ_MODEL
+              value: "openai/gpt-oss-20b"
+
+            
+
+---
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: taskgrid-api
+
+spec:
+  selector:
+    app: taskgrid-api
+
+  ports:
+    - port: 8080
+      targetPort: 8080

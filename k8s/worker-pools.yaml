@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskgrid-worker-cpu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taskgrid-worker-cpu
+  template:
+    metadata:
+      labels:
+        app: taskgrid-worker-cpu
+    spec:
+      containers:
+        - name: taskgrid-worker
+          image: taskgrid:latest
+          imagePullPolicy: Never
+          env:
+            - name: TASKGRID_MODE
+              value: "worker"
+            - name: WORKER_TYPE
+              value: "cpu"
+            - name: REDIS_ADDR
+              value: "redis:6379"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskgrid-worker-io
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taskgrid-worker-io
+  template:
+    metadata:
+      labels:
+        app: taskgrid-worker-io
+    spec:
+      containers:
+        - name: taskgrid-worker
+          image: taskgrid:latest
+          imagePullPolicy: Never
+          env:
+            - name: TASKGRID_MODE
+              value: "worker"
+            - name: WORKER_TYPE
+              value: "io"
+            - name: REDIS_ADDR
+              value: "redis:6379"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskgrid-worker-general
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taskgrid-worker-general
+  template:
+    metadata:
+      labels:
+        app: taskgrid-worker-general
+    spec:
+      containers:
+        - name: taskgrid-worker
+          image: taskgrid:latest
+          imagePullPolicy: Never
+          env:
+            - name: TASKGRID_MODE
+              value: "worker"
+            - name: WORKER_TYPE
+              value: "general"
+            - name: REDIS_ADDR
+              value: "redis:6379"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: taskgrid-worker-cpu
+spec:
+  scaleTargetRef:
+    name: taskgrid-worker-cpu
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 5
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc.cluster.local:6379
+        listName: taskgrid:jobs:cpu
+        listLength: "2"
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: taskgrid-worker-io
+spec:
+  scaleTargetRef:
+    name: taskgrid-worker-io
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 5
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc.cluster.local:6379
+        listName: taskgrid:jobs:io
+        listLength: "2"
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: taskgrid-worker-general
+spec:
+  scaleTargetRef:
+    name: taskgrid-worker-general
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 5
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc.cluster.local:6379
+        listName: taskgrid:jobs:general
+        listLength: "2"

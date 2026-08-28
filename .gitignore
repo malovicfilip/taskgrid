@@ -1,1 +1,7 @@
-taskgrid
+/taskgrid
+.env
+.env.*
+*.key
+*.pem
+*.log
+.DS_Store

@@ -1,0 +1,22 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+
+metadata:
+  name: taskgrid-worker
+
+spec:
+  scaleTargetRef:
+    name: taskgrid-worker
+
+  minReplicaCount: 3
+  maxReplicaCount: 10
+
+  pollingInterval: 5
+  cooldownPeriod: 30
+
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc.cluster.local:6379
+        listName: taskgrid:jobs
+        listLength: "2"

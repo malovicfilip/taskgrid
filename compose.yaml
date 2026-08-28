@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      TASKGRID_MODE: api
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    restart: unless-stopped
+    environment:
+      TASKGRID_MODE: worker
+      REDIS_ADDR: redis:6379
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:
