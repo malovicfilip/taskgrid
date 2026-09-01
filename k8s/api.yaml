@@ -25,6 +25,20 @@ spec:
           ports:
             - containerPort: 8080
 
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
           env:
             - name: TASKGRID_MODE
               value: "api"
@@ -41,6 +55,13 @@ spec:
 
             - name: GROQ_MODEL
               value: "openai/gpt-oss-20b"
+
+            - name: TASKGRID_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: taskgrid-ai
+                  key: TASKGRID_API_TOKEN
+                  optional: true
 
             
 

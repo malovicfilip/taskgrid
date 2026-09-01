@@ -3,15 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -62,7 +67,14 @@ type GroqResponse struct {
 	} `json:"choices"`
 }
 
-var ctx = context.Background()
+var ctx, cancel = context.WithCancel(context.Background())
+
+var (
+	requestsTotal atomic.Uint64
+	jobsCreated   atomic.Uint64
+	jobsSucceeded atomic.Uint64
+	jobsFailed    atomic.Uint64
+)
 
 const (
 	cpuQueue         = "taskgrid:jobs:cpu"
@@ -81,6 +93,23 @@ func getRedisAddress() string {
 	}
 
 	return addr
+}
+
+func apiToken() string {
+	return os.Getenv("TASKGRID_API_TOKEN")
+}
+
+func shellCommandsAllowed() bool {
+	return strings.EqualFold(os.Getenv("TASKGRID_ALLOW_SHELL_COMMANDS"), "true")
+}
+
+func parseCommand(command string) (string, []string, error) {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return "", nil, errors.New("command is required")
+	}
+
+	return parts[0], parts[1:], nil
 }
 
 var rdb = redis.NewClient(&redis.Options{
@@ -359,6 +388,57 @@ func healthHandler(
 	)
 }
 
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	if err := rdb.Ping(r.Context()).Err(); err != nil {
+		http.Error(w, "TaskGrid API is not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintln(w, "TaskGrid API is ready")
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_http_requests_total Total HTTP requests handled.\n# TYPE taskgrid_http_requests_total counter\ntaskgrid_http_requests_total %d\n", requestsTotal.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_created_total Total jobs accepted.\n# TYPE taskgrid_jobs_created_total counter\ntaskgrid_jobs_created_total %d\n", jobsCreated.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_succeeded_total Total jobs completed successfully.\n# TYPE taskgrid_jobs_succeeded_total counter\ntaskgrid_jobs_succeeded_total %d\n", jobsSucceeded.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_failed_total Total jobs that failed.\n# TYPE taskgrid_jobs_failed_total counter\ntaskgrid_jobs_failed_total %d\n", jobsFailed.Load())
+}
+
+func withAPIProtection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsTotal.Add(1)
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = fmt.Sprintf("req-%d", time.Now().UTC().UnixNano())
+		}
+		w.Header().Set("X-Request-ID", requestID)
+
+		// Health, readiness, and metrics must remain reachable by orchestrators.
+		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		expected := apiToken()
+		if expected == "" {
+			log.Println("WARNING: TASKGRID_API_TOKEN is unset; API authentication is disabled")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		provided := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(provided, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(provided, prefix)), []byte(expected)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func scheduleHandler(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -573,6 +653,8 @@ func createJobHandler(
 
 		return
 	}
+
+	jobsCreated.Add(1)
 
 	log.Println(
 		"AI routed",
@@ -1095,6 +1177,9 @@ func worker(
 		).Result()
 
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Println(
 				workerID,
 				"Redis error:",
@@ -1176,12 +1261,23 @@ func worker(
 			30*time.Second,
 		)
 
-		cmd := exec.CommandContext(
-			commandCtx,
-			"bash",
-			"-lc",
-			job.Command,
-		)
+		var cmd *exec.Cmd
+		if shellCommandsAllowed() {
+			cmd = exec.CommandContext(commandCtx, "bash", "-lc", job.Command)
+		} else {
+			executable, args, parseErr := parseCommand(job.Command)
+			if parseErr != nil {
+				job.Status = "FAILED"
+				job.Error = "invalid command: " + parseErr.Error()
+				job.FinishedAt = &startedAt
+				job.DurationMS = 0
+				_ = saveJob(job)
+				_ = rdb.LRem(ctx, processingQueue, 1, jobID).Err()
+				jobsFailed.Add(1)
+				continue
+			}
+			cmd = exec.CommandContext(commandCtx, executable, args...)
+		}
 
 		output, commandErr := cmd.CombinedOutput()
 
@@ -1203,14 +1299,17 @@ func worker(
 		if timedOut {
 			job.Status = "FAILED"
 			job.Error = "command timed out after 30 seconds"
+			jobsFailed.Add(1)
 
 		} else if commandErr != nil {
 			job.Status = "FAILED"
 			job.Error = commandErr.Error()
+			jobsFailed.Add(1)
 
 		} else {
 			job.Status = "SUCCEEDED"
 			job.Error = ""
+			jobsSucceeded.Add(1)
 		}
 
 		if err := saveJob(job); err != nil {
@@ -1254,36 +1353,42 @@ func worker(
 }
 
 func startAPI() {
-	http.HandleFunc(
-		"/health",
-		healthHandler,
-	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/readyz", readyHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
+	mux.HandleFunc("/schedule", scheduleHandler)
+	mux.HandleFunc("/jobs", jobsHandler)
+	mux.HandleFunc("/jobs/", jobByIDHandler)
 
-	http.HandleFunc(
-		"/schedule",
-		scheduleHandler,
-	)
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           withAPIProtection(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
-	http.HandleFunc(
-		"/jobs",
-		jobsHandler,
-	)
-
-	http.HandleFunc(
-		"/jobs/",
-		jobByIDHandler,
-	)
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-shutdown
+		log.Println("shutting down TaskGrid API")
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Println("graceful shutdown failed:", err)
+		}
+	}()
 
 	log.Println(
 		"TaskGrid API listening on port 8080",
 	)
 
-	err := http.ListenAndServe(
-		":8080",
-		nil,
-	)
-
-	if err != nil {
+	err := server.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

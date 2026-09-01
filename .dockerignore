@@ -1,4 +1,6 @@
 .git
+.gocache
+.gomodcache
 .gitignore
 taskgrid
 *.log

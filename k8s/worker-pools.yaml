@@ -23,6 +23,8 @@ spec:
               value: "cpu"
             - name: REDIS_ADDR
               value: "redis:6379"
+            - name: TASKGRID_ALLOW_SHELL_COMMANDS
+              value: "false"
           resources:
             requests:
               cpu: "100m"
@@ -57,6 +59,8 @@ spec:
               value: "io"
             - name: REDIS_ADDR
               value: "redis:6379"
+            - name: TASKGRID_ALLOW_SHELL_COMMANDS
+              value: "false"
           resources:
             requests:
               cpu: "50m"
@@ -91,6 +95,8 @@ spec:
               value: "general"
             - name: REDIS_ADDR
               value: "redis:6379"
+            - name: TASKGRID_ALLOW_SHELL_COMMANDS
+              value: "false"
           resources:
             requests:
               cpu: "50m"

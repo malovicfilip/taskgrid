@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          check-latest: true
+      - name: Run tests
+        run: go test ./...
+      - name: Build binary
+        run: go build ./...
+      - name: Build container image
+        run: docker build -t taskgrid:ci .

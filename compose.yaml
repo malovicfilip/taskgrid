@@ -4,6 +4,11 @@ services:
     restart: unless-stopped
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   api:
     build: .
@@ -11,10 +16,14 @@ services:
     environment:
       TASKGRID_MODE: api
       REDIS_ADDR: redis:6379
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      TASKGRID_API_TOKEN: ${TASKGRID_API_TOKEN:-}
     ports:
       - "8080:8080"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   worker:
     build: .
@@ -22,8 +31,10 @@ services:
     environment:
       TASKGRID_MODE: worker
       REDIS_ADDR: redis:6379
+      TASKGRID_ALLOW_SHELL_COMMANDS: "false"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
 volumes:
   redis-data:

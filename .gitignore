@@ -5,3 +5,5 @@
 *.pem
 *.log
 .DS_Store
+.gocache/
+.gomodcache/
