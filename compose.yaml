@@ -1,6 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     volumes:
       - redis-data:/data
@@ -19,22 +20,79 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
       TASKGRID_API_TOKEN: ${TASKGRID_API_TOKEN:-}
+      TASKGRID_ADMIN_TOKEN: ${TASKGRID_ADMIN_TOKEN:-}
+      TASKGRID_SUBMIT_TOKEN: ${TASKGRID_SUBMIT_TOKEN:-}
+      TASKGRID_READ_TOKEN: ${TASKGRID_READ_TOKEN:-}
+      TASKGRID_REQUIRE_AUTH: ${TASKGRID_REQUIRE_AUTH:-true}
+      TASKGRID_SCHEDULER_MODE: ${TASKGRID_SCHEDULER_MODE:-hybrid}
+      TASKGRID_JOB_RETENTION_HOURS: ${TASKGRID_JOB_RETENTION_HOURS:-168}
+      TASKGRID_RATE_LIMIT_PER_MINUTE: ${TASKGRID_RATE_LIMIT_PER_MINUTE:-600}
     ports:
       - "8080:8080"
     depends_on:
       redis:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 15s
 
-  worker:
+  worker-cpu:
     build: .
     restart: unless-stopped
     environment:
       TASKGRID_MODE: worker
+      WORKER_TYPE: cpu
       REDIS_ADDR: redis:6379
       TASKGRID_ALLOW_SHELL_COMMANDS: "false"
+      TASKGRID_ALLOWED_COMMANDS: ${TASKGRID_ALLOWED_COMMANDS:-echo,sleep,sha256sum}
+      TASKGRID_MAX_ATTEMPTS: ${TASKGRID_MAX_ATTEMPTS:-3}
+      TASKGRID_JOB_TIMEOUT_SECONDS: ${TASKGRID_JOB_TIMEOUT_SECONDS:-30}
+      TASKGRID_MAX_OUTPUT_BYTES: ${TASKGRID_MAX_OUTPUT_BYTES:-65536}
+      TASKGRID_JOB_RETENTION_HOURS: ${TASKGRID_JOB_RETENTION_HOURS:-168}
     depends_on:
       redis:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 15s
+
+  worker-io:
+    extends:
+      service: worker-cpu
+    environment:
+      TASKGRID_MODE: worker
+      WORKER_TYPE: io
+      REDIS_ADDR: redis:6379
+      TASKGRID_ALLOW_SHELL_COMMANDS: "false"
+      TASKGRID_ALLOWED_COMMANDS: ${TASKGRID_ALLOWED_COMMANDS:-echo,sleep,sha256sum}
+      TASKGRID_MAX_ATTEMPTS: ${TASKGRID_MAX_ATTEMPTS:-3}
+      TASKGRID_JOB_TIMEOUT_SECONDS: ${TASKGRID_JOB_TIMEOUT_SECONDS:-30}
+      TASKGRID_MAX_OUTPUT_BYTES: ${TASKGRID_MAX_OUTPUT_BYTES:-65536}
+      TASKGRID_JOB_RETENTION_HOURS: ${TASKGRID_JOB_RETENTION_HOURS:-168}
+
+  worker-general:
+    extends:
+      service: worker-cpu
+    environment:
+      TASKGRID_MODE: worker
+      WORKER_TYPE: general
+      REDIS_ADDR: redis:6379
+      TASKGRID_ALLOW_SHELL_COMMANDS: "false"
+      TASKGRID_ALLOWED_COMMANDS: ${TASKGRID_ALLOWED_COMMANDS:-echo,sleep,sha256sum}
+      TASKGRID_MAX_ATTEMPTS: ${TASKGRID_MAX_ATTEMPTS:-3}
+      TASKGRID_JOB_TIMEOUT_SECONDS: ${TASKGRID_JOB_TIMEOUT_SECONDS:-30}
+      TASKGRID_MAX_OUTPUT_BYTES: ${TASKGRID_MAX_OUTPUT_BYTES:-65536}
+      TASKGRID_JOB_RETENTION_HOURS: ${TASKGRID_JOB_RETENTION_HOURS:-168}
 
 volumes:
   redis-data:

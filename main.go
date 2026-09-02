@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,7 +37,10 @@ type Job struct {
 	WorkerID         string     `json:"worker_id,omitempty"`
 	Output           string     `json:"output,omitempty"`
 	Error            string     `json:"error,omitempty"`
+	LastError        string     `json:"last_error,omitempty"`
 	Attempts         int        `json:"attempts"`
+	MaxAttempts      int        `json:"max_attempts"`
+	OutputTruncated  bool       `json:"output_truncated,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	StartedAt        *time.Time `json:"started_at,omitempty"`
 	FinishedAt       *time.Time `json:"finished_at,omitempty"`
@@ -70,20 +76,121 @@ type GroqResponse struct {
 var ctx, cancel = context.WithCancel(context.Background())
 
 var (
-	requestsTotal atomic.Uint64
-	jobsCreated   atomic.Uint64
-	jobsSucceeded atomic.Uint64
-	jobsFailed    atomic.Uint64
+	requestsTotal      atomic.Uint64
+	responses2xx       atomic.Uint64
+	responses4xx       atomic.Uint64
+	responses5xx       atomic.Uint64
+	authFailures       atomic.Uint64
+	rateLimited        atomic.Uint64
+	aiRequests         atomic.Uint64
+	aiFallbacks        atomic.Uint64
+	authDisabledNotice sync.Once
+	recoveryLoopOnce   sync.Once
+	latencyBuckets     = [...]float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
+	latencyCounts      [9]atomic.Uint64
+	latencyMicrosTotal atomic.Uint64
 )
 
 const (
-	cpuQueue         = "taskgrid:jobs:cpu"
-	ioQueue          = "taskgrid:jobs:io"
-	generalQueue     = "taskgrid:jobs:general"
-	processingPrefix = "taskgrid:processing:"
-	heartbeatPrefix  = "taskgrid:heartbeat:"
-	jobKeyPrefix     = "taskgrid:job:"
+	cpuQueue          = "taskgrid:jobs:cpu"
+	ioQueue           = "taskgrid:jobs:io"
+	generalQueue      = "taskgrid:jobs:general"
+	processingPrefix  = "taskgrid:processing:"
+	heartbeatPrefix   = "taskgrid:heartbeat:"
+	jobKeyPrefix      = "taskgrid:job:"
+	idempotencyPrefix = "taskgrid:idempotency:"
+	jobIndexKey       = "taskgrid:jobs:index"
+	deadLetterQueue   = "taskgrid:jobs:dead"
 )
+
+type contextKey string
+
+const roleContextKey contextKey = "taskgrid-role"
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+type limitedBuffer struct {
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	originalLength := len(p)
+	remaining := b.limit - b.buffer.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return originalLength, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.truncated = true
+	}
+	_, _ = b.buffer.Write(p)
+	return originalLength, nil
+}
+
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	if r.status != 0 {
+		return
+	}
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(body []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(body)
+}
+
+func envInt(name string, fallback, minimum, maximum int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < minimum || parsed > maximum {
+		log.Printf("WARNING: %s=%q is invalid; using %d", name, value, fallback)
+		return fallback
+	}
+	return parsed
+}
+
+func maxAttempts() int {
+	return envInt("TASKGRID_MAX_ATTEMPTS", 3, 1, 20)
+}
+
+func jobTimeout() time.Duration {
+	return time.Duration(envInt("TASKGRID_JOB_TIMEOUT_SECONDS", 30, 1, 3600)) * time.Second
+}
+
+func maxOutputBytes() int {
+	return envInt("TASKGRID_MAX_OUTPUT_BYTES", 65536, 1024, 10485760)
+}
+
+func jobRetention() time.Duration {
+	return time.Duration(envInt("TASKGRID_JOB_RETENTION_HOURS", 168, 1, 8760)) * time.Hour
+}
+
+func rateLimitPerMinute() int {
+	return envInt("TASKGRID_RATE_LIMIT_PER_MINUTE", 0, 0, 100000)
+}
 
 func getRedisAddress() string {
 	addr := os.Getenv("REDIS_ADDR")
@@ -99,6 +206,45 @@ func apiToken() string {
 	return os.Getenv("TASKGRID_API_TOKEN")
 }
 
+func adminToken() string {
+	return strings.TrimSpace(os.Getenv("TASKGRID_ADMIN_TOKEN"))
+}
+
+func submitToken() string {
+	return strings.TrimSpace(os.Getenv("TASKGRID_SUBMIT_TOKEN"))
+}
+
+func readToken() string {
+	return strings.TrimSpace(os.Getenv("TASKGRID_READ_TOKEN"))
+}
+
+func authRequired() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("TASKGRID_REQUIRE_AUTH")), "true")
+}
+
+func validateAuthConfig() error {
+	tokens := map[string]string{
+		"legacy-admin": strings.TrimSpace(apiToken()),
+		"admin":        adminToken(),
+		"submit":       submitToken(),
+		"read":         readToken(),
+	}
+	seen := make(map[string]string)
+	for role, token := range tokens {
+		if token == "" {
+			continue
+		}
+		if otherRole, exists := seen[token]; exists {
+			return fmt.Errorf("%s and %s API tokens must be different", otherRole, role)
+		}
+		seen[token] = role
+	}
+	if authRequired() && len(seen) == 0 {
+		return errors.New("TASKGRID_REQUIRE_AUTH=true but no API token is configured")
+	}
+	return nil
+}
+
 func shellCommandsAllowed() bool {
 	return strings.EqualFold(os.Getenv("TASKGRID_ALLOW_SHELL_COMMANDS"), "true")
 }
@@ -109,7 +255,79 @@ func parseCommand(command string) (string, []string, error) {
 		return "", nil, errors.New("command is required")
 	}
 
-	return parts[0], parts[1:], nil
+	executable := parts[0]
+	allowedValue := strings.TrimSpace(os.Getenv("TASKGRID_ALLOWED_COMMANDS"))
+	if allowedValue != "" {
+		allowed := false
+		for _, candidate := range strings.Split(allowedValue, ",") {
+			if strings.EqualFold(strings.TrimSpace(candidate), executable) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", nil, fmt.Errorf("executable %q is not in TASKGRID_ALLOWED_COMMANDS", executable)
+		}
+	}
+
+	return executable, parts[1:], nil
+}
+
+func schedulerMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("TASKGRID_SCHEDULER_MODE")))
+	if mode == "" {
+		return "hybrid"
+	}
+	return mode
+}
+
+func scheduleWithRules(req ScheduleRequest) SchedulingDecision {
+	text := strings.ToLower(req.Name + " " + req.Description + " " + req.Command)
+	description := strings.ToLower(req.Description)
+	for _, workloadType := range []string{"cpu", "io", "general"} {
+		if strings.Contains(description, "[workload:"+workloadType+"]") {
+			return SchedulingDecision{
+				WorkloadType: workloadType,
+				Priority:     "normal",
+				Reason:       "Deterministic rules honored an explicit workload hint.",
+			}
+		}
+	}
+
+	cpuTerms := []string{"compile", "encode", "render", "calculate", "compute", "simulation", "machine learning", "sha256", "benchmark"}
+	for _, term := range cpuTerms {
+		if strings.Contains(text, term) {
+			return SchedulingDecision{WorkloadType: "cpu", Priority: "normal", Reason: "Deterministic rules identified a compute-heavy workload."}
+		}
+	}
+
+	ioTerms := []string{"download", "upload", "network", "database", "backup", "file", "storage", "sleep", "wait"}
+	for _, term := range ioTerms {
+		if strings.Contains(text, term) {
+			return SchedulingDecision{WorkloadType: "io", Priority: "normal", Reason: "Deterministic rules identified an I/O or waiting workload."}
+		}
+	}
+
+	return SchedulingDecision{WorkloadType: "general", Priority: "normal", Reason: "Deterministic rules selected the general workload pool."}
+}
+
+func scheduleJob(req ScheduleRequest) (SchedulingDecision, error) {
+	switch schedulerMode() {
+	case "rules":
+		return scheduleWithRules(req), nil
+	case "ai":
+		return scheduleWithAI(req)
+	case "hybrid":
+		decision, err := scheduleWithAI(req)
+		if err == nil {
+			return decision, nil
+		}
+		aiFallbacks.Add(1)
+		log.Printf("AI scheduler unavailable; using deterministic rules: %v", err)
+		return scheduleWithRules(req), nil
+	default:
+		return SchedulingDecision{}, fmt.Errorf("invalid TASKGRID_SCHEDULER_MODE %q", schedulerMode())
+	}
 }
 
 var rdb = redis.NewClient(&redis.Options{
@@ -139,7 +357,7 @@ func saveJob(job Job) error {
 		ctx,
 		jobKeyPrefix+job.ID,
 		data,
-		0,
+		jobRetention(),
 	).Err()
 }
 
@@ -165,7 +383,122 @@ func loadJob(jobID string) (Job, error) {
 	return job, nil
 }
 
+func idempotencyRedisKey(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%s%x", idempotencyPrefix, digest)
+}
+
+func loadIdempotentJob(value string) (Job, bool, error) {
+	jobID, err := rdb.Get(ctx, idempotencyRedisKey(value)).Result()
+	if err == redis.Nil {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, err
+	}
+
+	job, err := loadJob(jobID)
+	if err == redis.Nil {
+		_ = rdb.Del(ctx, idempotencyRedisKey(value)).Err()
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, err
+	}
+	return job, true, nil
+}
+
+func enqueueJob(job Job, queue, idempotencyKey string) (bool, string, error) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return false, "", err
+	}
+
+	hasIdempotency := "0"
+	idempotencyRedis := idempotencyPrefix + "none"
+	if idempotencyKey != "" {
+		hasIdempotency = "1"
+		idempotencyRedis = idempotencyRedisKey(idempotencyKey)
+	}
+
+	script := redis.NewScript(`
+		if ARGV[5] == "1" then
+			local existing = redis.call("GET", KEYS[3])
+			if existing then
+				return {0, existing}
+			end
+		end
+		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+		redis.call("LPUSH", KEYS[2], ARGV[3])
+		redis.call("ZREMRANGEBYSCORE", KEYS[4], "-inf", ARGV[6])
+		redis.call("ZADD", KEYS[4], ARGV[4], ARGV[3])
+		redis.call("INCR", KEYS[5])
+		if ARGV[5] == "1" then
+			redis.call("SET", KEYS[3], ARGV[3], "EX", ARGV[2])
+		end
+		return {1, ARGV[3]}
+	`)
+
+	result, err := script.Run(ctx, rdb, []string{
+		jobKeyPrefix + job.ID,
+		queue,
+		idempotencyRedis,
+		jobIndexKey,
+		"taskgrid:metrics:jobs_created_total",
+	}, string(data), int64(jobRetention().Seconds()), job.ID, job.CreatedAt.UnixMilli(), hasIdempotency, time.Now().Add(-jobRetention()).UnixMilli()).Slice()
+	if err != nil {
+		return false, "", err
+	}
+	if len(result) != 2 {
+		return false, "", fmt.Errorf("unexpected enqueue result")
+	}
+
+	created, ok := result[0].(int64)
+	if !ok {
+		return false, "", fmt.Errorf("unexpected enqueue status")
+	}
+	jobID, ok := result[1].(string)
+	if !ok {
+		return false, "", fmt.Errorf("unexpected enqueue job ID")
+	}
+	return created == 1, jobID, nil
+}
+
+func persistAndMove(job Job, processingQueue, targetQueue, metricKey string) error {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+
+	script := redis.NewScript(`
+		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+		local removed = redis.call("LREM", KEYS[2], 1, ARGV[3])
+		if removed == 1 and KEYS[3] ~= "" then
+			redis.call("LPUSH", KEYS[3], ARGV[3])
+		end
+		if KEYS[4] ~= "" then
+			redis.call("INCR", KEYS[4])
+		end
+		return removed
+	`)
+
+	moved, err := script.Run(ctx, rdb, []string{
+		jobKeyPrefix + job.ID,
+		processingQueue,
+		targetQueue,
+		metricKey,
+	}, string(data), int64(jobRetention().Seconds()), job.ID).Int()
+	if err != nil {
+		return err
+	}
+	if moved != 1 {
+		return fmt.Errorf("job %s was not present in processing queue %s", job.ID, processingQueue)
+	}
+	return nil
+}
+
 func scheduleWithAI(req ScheduleRequest) (SchedulingDecision, error) {
+	aiRequests.Add(1)
 	apiKey := os.Getenv("GROQ_API_KEY")
 
 	if apiKey == "" {
@@ -290,7 +623,7 @@ Return only JSON using exactly this structure:
 	if resp.StatusCode < 200 ||
 		resp.StatusCode >= 300 {
 
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 
 		return SchedulingDecision{},
 			fmt.Errorf(
@@ -372,20 +705,8 @@ func healthHandler(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		http.Error(
-			w,
-			"TaskGrid API cannot reach Redis",
-			http.StatusServiceUnavailable,
-		)
-
-		return
-	}
-
-	fmt.Fprintln(
-		w,
-		"TaskGrid API is healthy",
-	)
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintln(w, "TaskGrid API is alive")
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
@@ -399,44 +720,249 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	redisUp := 1
+	if err := rdb.Ping(r.Context()).Err(); err != nil {
+		redisUp = 0
+	}
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_redis_up Whether the API can reach Redis.\n# TYPE taskgrid_redis_up gauge\ntaskgrid_redis_up %d\n", redisUp)
 	_, _ = fmt.Fprintf(w, "# HELP taskgrid_http_requests_total Total HTTP requests handled.\n# TYPE taskgrid_http_requests_total counter\ntaskgrid_http_requests_total %d\n", requestsTotal.Load())
-	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_created_total Total jobs accepted.\n# TYPE taskgrid_jobs_created_total counter\ntaskgrid_jobs_created_total %d\n", jobsCreated.Load())
-	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_succeeded_total Total jobs completed successfully.\n# TYPE taskgrid_jobs_succeeded_total counter\ntaskgrid_jobs_succeeded_total %d\n", jobsSucceeded.Load())
-	_, _ = fmt.Fprintf(w, "# HELP taskgrid_jobs_failed_total Total jobs that failed.\n# TYPE taskgrid_jobs_failed_total counter\ntaskgrid_jobs_failed_total %d\n", jobsFailed.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_http_responses_total HTTP responses by status class.\n# TYPE taskgrid_http_responses_total counter\ntaskgrid_http_responses_total{class=\"2xx\"} %d\ntaskgrid_http_responses_total{class=\"4xx\"} %d\ntaskgrid_http_responses_total{class=\"5xx\"} %d\n", responses2xx.Load(), responses4xx.Load(), responses5xx.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_auth_failures_total Rejected authentication or authorization attempts.\n# TYPE taskgrid_auth_failures_total counter\ntaskgrid_auth_failures_total %d\n", authFailures.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_rate_limited_total Requests rejected by the per-credential rate limit.\n# TYPE taskgrid_rate_limited_total counter\ntaskgrid_rate_limited_total %d\n", rateLimited.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_ai_schedule_requests_total Scheduling requests sent to the AI provider.\n# TYPE taskgrid_ai_schedule_requests_total counter\ntaskgrid_ai_schedule_requests_total %d\n", aiRequests.Load())
+	_, _ = fmt.Fprintf(w, "# HELP taskgrid_ai_fallbacks_total AI scheduling failures handled by deterministic rules.\n# TYPE taskgrid_ai_fallbacks_total counter\ntaskgrid_ai_fallbacks_total %d\n", aiFallbacks.Load())
+
+	_, _ = fmt.Fprintln(w, "# HELP taskgrid_http_request_duration_seconds Request latency histogram.")
+	_, _ = fmt.Fprintln(w, "# TYPE taskgrid_http_request_duration_seconds histogram")
+	for i, upperBound := range latencyBuckets {
+		_, _ = fmt.Fprintf(w, "taskgrid_http_request_duration_seconds_bucket{le=\"%g\"} %d\n", upperBound, latencyCounts[i].Load())
+	}
+	_, _ = fmt.Fprintf(w, "taskgrid_http_request_duration_seconds_bucket{le=\"+Inf\"} %d\n", latencyCounts[len(latencyCounts)-1].Load())
+	_, _ = fmt.Fprintf(w, "taskgrid_http_request_duration_seconds_sum %.6f\n", float64(latencyMicrosTotal.Load())/1_000_000)
+	_, _ = fmt.Fprintf(w, "taskgrid_http_request_duration_seconds_count %d\n", latencyCounts[len(latencyCounts)-1].Load())
+
+	redisMetrics := []struct {
+		name string
+		help string
+		key  string
+	}{
+		{"taskgrid_jobs_created_total", "Total jobs accepted.", "taskgrid:metrics:jobs_created_total"},
+		{"taskgrid_jobs_succeeded_total", "Total jobs completed successfully.", "taskgrid:metrics:jobs_succeeded_total"},
+		{"taskgrid_jobs_failed_total", "Total jobs sent to the dead-letter queue.", "taskgrid:metrics:jobs_failed_total"},
+		{"taskgrid_job_retries_total", "Total job attempts requeued for retry.", "taskgrid:metrics:job_retries_total"},
+		{"taskgrid_job_recoveries_total", "Total jobs recovered after a worker failure.", "taskgrid:metrics:job_recoveries_total"},
+	}
+	for _, metric := range redisMetrics {
+		value, err := rdb.Get(r.Context(), metric.key).Uint64()
+		if err != nil && err != redis.Nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", metric.name, metric.help, metric.name, metric.name, value)
+	}
+
+	_, _ = fmt.Fprintln(w, "# HELP taskgrid_queue_depth Current Redis queue depth.")
+	_, _ = fmt.Fprintln(w, "# TYPE taskgrid_queue_depth gauge")
+	queues := []struct {
+		label string
+		key   string
+	}{
+		{"cpu", cpuQueue},
+		{"io", ioQueue},
+		{"general", generalQueue},
+		{"dead_letter", deadLetterQueue},
+	}
+	for _, queue := range queues {
+		depth, err := rdb.LLen(r.Context(), queue.key).Result()
+		if err == nil {
+			_, _ = fmt.Fprintf(w, "taskgrid_queue_depth{queue=\"%s\"} %d\n", queue.label, depth)
+		}
+	}
 }
 
 func withAPIProtection(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
 		requestsTotal.Add(1)
 		requestID := r.Header.Get("X-Request-ID")
-		if requestID == "" {
+		if requestID == "" || len(requestID) > 128 {
 			requestID = fmt.Sprintf("req-%d", time.Now().UTC().UnixNano())
 		}
 		w.Header().Set("X-Request-ID", requestID)
+		recorder := &statusRecorder{ResponseWriter: w}
+		role := "anonymous"
 
 		// Health, readiness, and metrics must remain reachable by orchestrators.
 		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
+			next.ServeHTTP(recorder, r)
+		} else {
+			configured := apiToken() != "" || adminToken() != "" || submitToken() != "" || readToken() != ""
+			if !configured {
+				authDisabledNotice.Do(func() {
+					log.Println("WARNING: no TaskGrid API tokens are configured; authentication is disabled")
+				})
+				role = "admin"
+			} else {
+				provided := r.Header.Get("Authorization")
+				const prefix = "Bearer "
+				if !strings.HasPrefix(provided, prefix) {
+					authFailures.Add(1)
+					w.Header().Set("WWW-Authenticate", "Bearer")
+					http.Error(recorder, "unauthorized", http.StatusUnauthorized)
+					finishRequest(recorder, r, requestID, role, started)
+					return
+				}
+
+				token := strings.TrimPrefix(provided, prefix)
+				switch {
+				case tokenMatches(token, adminToken()):
+					role = "admin"
+				case tokenMatches(token, strings.TrimSpace(apiToken())):
+					role = "admin"
+				case tokenMatches(token, submitToken()):
+					role = "submit"
+				case tokenMatches(token, readToken()):
+					role = "read"
+				default:
+					authFailures.Add(1)
+					w.Header().Set("WWW-Authenticate", "Bearer")
+					http.Error(recorder, "unauthorized", http.StatusUnauthorized)
+					finishRequest(recorder, r, requestID, role, started)
+					return
+				}
+
+				allowed, err := withinRateLimit(r.Context(), token)
+				if err != nil {
+					http.Error(recorder, "rate limiter unavailable", http.StatusServiceUnavailable)
+					finishRequest(recorder, r, requestID, role, started)
+					return
+				}
+				if !allowed {
+					rateLimited.Add(1)
+					w.Header().Set("Retry-After", "60")
+					http.Error(recorder, "rate limit exceeded", http.StatusTooManyRequests)
+					finishRequest(recorder, r, requestID, role, started)
+					return
+				}
+			}
+
+			if !roleCanAccess(role, r) {
+				authFailures.Add(1)
+				http.Error(recorder, "forbidden", http.StatusForbidden)
+				finishRequest(recorder, r, requestID, role, started)
+				return
+			}
+
+			r = r.WithContext(context.WithValue(r.Context(), roleContextKey, role))
+			next.ServeHTTP(recorder, r)
 		}
 
-		expected := apiToken()
-		if expected == "" {
-			log.Println("WARNING: TASKGRID_API_TOKEN is unset; API authentication is disabled")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		provided := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(provided, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(provided, prefix)), []byte(expected)) != 1 {
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		next.ServeHTTP(w, r)
+		finishRequest(recorder, r, requestID, role, started)
 	})
+}
+
+func withinRateLimit(requestContext context.Context, token string) (bool, error) {
+	limit := rateLimitPerMinute()
+	if limit == 0 {
+		return true, nil
+	}
+	digest := sha256.Sum256([]byte(token))
+	window := time.Now().UTC().Unix() / 60
+	key := fmt.Sprintf("taskgrid:ratelimit:%x:%d", digest, window)
+	script := redis.NewScript(`
+		local count = redis.call("INCR", KEYS[1])
+		if count == 1 then
+			redis.call("EXPIRE", KEYS[1], 120)
+		end
+		return count
+	`)
+	count, err := script.Run(requestContext, rdb, []string{key}).Int()
+	if err != nil {
+		return false, err
+	}
+	return count <= limit, nil
+}
+
+func tokenMatches(provided, expected string) bool {
+	return expected != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func roleCanAccess(role string, r *http.Request) bool {
+	if role == "admin" {
+		return true
+	}
+	if role == "submit" {
+		return r.Method == http.MethodPost && (r.URL.Path == "/jobs" || r.URL.Path == "/schedule")
+	}
+	if role == "read" {
+		return r.Method == http.MethodGet && (r.URL.Path == "/jobs" || strings.HasPrefix(r.URL.Path, "/jobs/"))
+	}
+	return false
+}
+
+func finishRequest(recorder *statusRecorder, r *http.Request, requestID, role string, started time.Time) {
+	status := recorder.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	switch {
+	case status >= 200 && status < 300:
+		responses2xx.Add(1)
+	case status >= 400 && status < 500:
+		responses4xx.Add(1)
+	case status >= 500:
+		responses5xx.Add(1)
+	}
+
+	duration := time.Since(started)
+	latencyMicrosTotal.Add(uint64(duration.Microseconds()))
+	seconds := duration.Seconds()
+	for i, upperBound := range latencyBuckets {
+		if seconds <= upperBound {
+			latencyCounts[i].Add(1)
+		}
+	}
+	latencyCounts[len(latencyCounts)-1].Add(1)
+
+	entry, _ := json.Marshal(map[string]interface{}{
+		"event":       "http_request",
+		"request_id":  requestID,
+		"method":      r.Method,
+		"path":        r.URL.Path,
+		"status":      status,
+		"role":        role,
+		"duration_ms": duration.Milliseconds(),
+	})
+	log.Print(string(entry))
+}
+
+func decodeJSONRequest(w http.ResponseWriter, r *http.Request, destination interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		http.Error(w, "invalid JSON request", http.StatusBadRequest)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "request body must contain one JSON object", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func validateScheduleRequest(req ScheduleRequest) error {
+	if len(req.Name) > 200 {
+		return errors.New("name must be 200 characters or fewer")
+	}
+	if len(req.Description) > 4000 {
+		return errors.New("description must be 4000 characters or fewer")
+	}
+	if len(req.Command) > 2000 {
+		return errors.New("command must be 2000 characters or fewer")
+	}
+	return nil
 }
 
 func scheduleHandler(
@@ -455,16 +981,11 @@ func scheduleHandler(
 
 	var req ScheduleRequest
 
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&req); err != nil {
-		http.Error(
-			w,
-			"invalid JSON request",
-			http.StatusBadRequest,
-		)
-
+	if !decodeJSONRequest(w, r, &req) {
+		return
+	}
+	if err := validateScheduleRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -480,7 +1001,7 @@ func scheduleHandler(
 		return
 	}
 
-	decision, err := scheduleWithAI(req)
+	decision, err := scheduleJob(req)
 	if err != nil {
 		log.Println(
 			"AI scheduling failed:",
@@ -537,16 +1058,11 @@ func createJobHandler(
 ) {
 	var req CreateJobRequest
 
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&req); err != nil {
-		http.Error(
-			w,
-			"invalid JSON request",
-			http.StatusBadRequest,
-		)
-
+	if !decodeJSONRequest(w, r, &req) {
+		return
+	}
+	if err := validateScheduleRequest(ScheduleRequest(req)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -570,7 +1086,25 @@ func createJobHandler(
 		return
 	}
 
-	decision, err := scheduleWithAI(
+	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if len(idempotencyKey) > 128 {
+		http.Error(w, "Idempotency-Key must be 128 characters or fewer", http.StatusBadRequest)
+		return
+	}
+	if idempotencyKey != "" {
+		existing, found, err := loadIdempotentJob(idempotencyKey)
+		if err != nil {
+			http.Error(w, "failed to resolve idempotency key", http.StatusInternalServerError)
+			return
+		}
+		if found {
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+	}
+
+	decision, err := scheduleJob(
 		ScheduleRequest{
 			Name:        req.Name,
 			Description: req.Description,
@@ -579,17 +1113,9 @@ func createJobHandler(
 	)
 
 	if err != nil {
-		log.Println(
-			"AI scheduler failed, using general queue:",
-			err,
-		)
-
-		decision = SchedulingDecision{
-			WorkloadType: "general",
-			Priority:     "normal",
-			Reason: "AI scheduler unavailable, " +
-				"defaulted to general workload.",
-		}
+		log.Println("job scheduling failed:", err)
+		http.Error(w, "job scheduling failed", http.StatusServiceUnavailable)
+		return
 	}
 
 	jobNumber, err := rdb.Incr(
@@ -622,39 +1148,29 @@ func createJobHandler(
 		Priority:         decision.Priority,
 		SchedulingReason: decision.Reason,
 		Attempts:         0,
+		MaxAttempts:      maxAttempts(),
 		CreatedAt:        time.Now().UTC(),
-	}
-
-	if err := saveJob(job); err != nil {
-		http.Error(
-			w,
-			"failed to save job",
-			http.StatusInternalServerError,
-		)
-
-		return
 	}
 
 	queue := jobQueueFor(
 		job.WorkloadType,
 	)
 
-	if err := rdb.LPush(
-		ctx,
-		queue,
-		job.ID,
-	).Err(); err != nil {
-
-		http.Error(
-			w,
-			"failed to enqueue job",
-			http.StatusInternalServerError,
-		)
-
+	created, resolvedJobID, err := enqueueJob(job, queue, idempotencyKey)
+	if err != nil {
+		http.Error(w, "failed to atomically enqueue job", http.StatusInternalServerError)
 		return
 	}
-
-	jobsCreated.Add(1)
+	if !created {
+		existing, err := loadJob(resolvedJobID)
+		if err != nil {
+			http.Error(w, "failed to load idempotent job", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Idempotent-Replayed", "true")
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
 
 	log.Println(
 		"AI routed",
@@ -665,22 +1181,14 @@ func createJobHandler(
 		job.Priority,
 	)
 
-	w.Header().Set(
-		"Content-Type",
-		"application/json",
-	)
+	writeJSON(w, http.StatusCreated, job)
+}
 
-	w.WriteHeader(
-		http.StatusCreated,
-	)
-
-	if err := json.NewEncoder(w).Encode(
-		job,
-	); err != nil {
-		log.Println(
-			"failed to encode response:",
-			err,
-		)
+func writeJSON(w http.ResponseWriter, status int, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Println("failed to encode response:", err)
 	}
 }
 
@@ -688,103 +1196,94 @@ func listJobsHandler(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	var cursor uint64
-
-	jobList := make(
-		[]Job,
-		0,
-	)
-
-	for {
-		keys, nextCursor, err := rdb.Scan(
-			ctx,
-			cursor,
-			jobKeyPrefix+"*",
-			100,
-		).Result()
-
-		if err != nil {
-			http.Error(
-				w,
-				"failed to list jobs",
-				http.StatusInternalServerError,
-			)
-
+	limit := 50
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 200 {
+			http.Error(w, "limit must be between 1 and 200", http.StatusBadRequest)
 			return
 		}
+		limit = parsed
+	}
 
-		for _, key := range keys {
-			data, err := rdb.Get(
-				ctx,
-				key,
-			).Result()
-
-			if err != nil {
-				log.Println(
-					"failed to load",
-					key,
-					":",
-					err,
-				)
-
-				continue
-			}
-
-			var job Job
-
-			if err := json.Unmarshal(
-				[]byte(data),
-				&job,
-			); err != nil {
-
-				log.Println(
-					"failed to decode",
-					key,
-					":",
-					err,
-				)
-
-				continue
-			}
-
-			jobList = append(
-				jobList,
-				job,
-			)
+	offset := 0
+	if value := r.URL.Query().Get("offset"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 1_000_000 {
+			http.Error(w, "offset must be between 0 and 1000000", http.StatusBadRequest)
+			return
 		}
+		offset = parsed
+	}
 
+	jobIDs, err := rdb.ZRevRange(r.Context(), jobIndexKey, int64(offset), int64(offset+limit-1)).Result()
+	if err != nil {
+		http.Error(w, "failed to list jobs", http.StatusInternalServerError)
+		return
+	}
+
+	jobList := make([]Job, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		job, err := loadJob(jobID)
+		if err == redis.Nil {
+			_ = rdb.ZRem(r.Context(), jobIndexKey, jobID).Err()
+			continue
+		}
+		if job.MaxAttempts <= 0 {
+			job.MaxAttempts = maxAttempts()
+		}
+		if err != nil {
+			log.Printf("failed to load indexed job %s: %v", jobID, err)
+			continue
+		}
+		jobList = append(jobList, job)
+	}
+
+	// Upgrade compatibility: older TaskGrid versions did not maintain the index.
+	if len(jobIDs) == 0 && offset == 0 {
+		legacyJobs, err := scanLegacyJobs(r.Context())
+		if err != nil {
+			http.Error(w, "failed to list jobs", http.StatusInternalServerError)
+			return
+		}
+		if len(legacyJobs) > limit {
+			legacyJobs = legacyJobs[:limit]
+		}
+		jobList = legacyJobs
+	}
+
+	w.Header().Set("X-Page-Limit", strconv.Itoa(limit))
+	w.Header().Set("X-Page-Offset", strconv.Itoa(offset))
+	writeJSON(w, http.StatusOK, jobList)
+}
+
+func scanLegacyJobs(requestContext context.Context) ([]Job, error) {
+	var cursor uint64
+	jobs := make([]Job, 0)
+	for {
+		keys, nextCursor, err := rdb.Scan(requestContext, cursor, jobKeyPrefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			data, err := rdb.Get(requestContext, key).Bytes()
+			if err != nil {
+				continue
+			}
+			var job Job
+			if err := json.Unmarshal(data, &job); err != nil {
+				continue
+			}
+			jobs = append(jobs, job)
+			_ = rdb.ZAdd(requestContext, jobIndexKey, redis.Z{Score: float64(job.CreatedAt.UnixMilli()), Member: job.ID}).Err()
+		}
 		cursor = nextCursor
-
 		if cursor == 0 {
 			break
 		}
 	}
-
-	sort.Slice(
-		jobList,
-		func(i int, j int) bool {
-			return jobList[i].
-				CreatedAt.
-				Before(
-					jobList[j].
-						CreatedAt,
-				)
-		},
-	)
-
-	w.Header().Set(
-		"Content-Type",
-		"application/json",
-	)
-
-	if err := json.NewEncoder(w).Encode(
-		jobList,
-	); err != nil {
-		log.Println(
-			"failed to encode job list:",
-			err,
-		)
-	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
+	return jobs, nil
 }
 
 func jobByIDHandler(
@@ -882,25 +1381,32 @@ func startHeartbeat(workerID string) {
 
 	go func() {
 		defer ticker.Stop()
-
-		for range ticker.C {
-			updateHeartbeat()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				updateHeartbeat()
+			}
 		}
 	}()
 }
 
 func startRecoveryLoop() {
-	ticker := time.NewTicker(
-		5 * time.Second,
-	)
-
-	go func() {
-		defer ticker.Stop()
-
-		for range ticker.C {
-			recoverDeadWorkers()
-		}
-	}()
+	recoveryLoopOnce.Do(func() {
+		ticker := time.NewTicker(5 * time.Second)
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					recoverDeadWorkers()
+				}
+			}
+		}()
+	})
 }
 
 func recoverDeadWorkers() {
@@ -979,25 +1485,6 @@ func recoverProcessingQueue(
 		return
 	}
 
-	requeueScript := redis.NewScript(`
-		local removed = redis.call(
-			"LREM",
-			KEYS[1],
-			1,
-			ARGV[1]
-		)
-
-		if removed == 1 then
-			redis.call(
-				"LPUSH",
-				KEYS[2],
-				ARGV[1]
-			)
-		end
-
-		return removed
-	`)
-
 	for _, jobID := range jobIDs {
 		job, err := loadJob(jobID)
 
@@ -1010,6 +1497,9 @@ func recoverProcessingQueue(
 			)
 
 			continue
+		}
+		if job.MaxAttempts <= 0 {
+			job.MaxAttempts = maxAttempts()
 		}
 
 		// If the job already completed but its
@@ -1036,6 +1526,13 @@ func recoverProcessingQueue(
 			continue
 		}
 
+		if job.Attempts >= job.MaxAttempts {
+			if err := deadLetterJob(&job, processingKey, "maximum attempts reached after worker failure"); err != nil {
+				log.Printf("failed dead-lettering abandoned %s: %v", jobID, err)
+			}
+			continue
+		}
+
 		targetQueue := jobQueueFor(
 			job.WorkloadType,
 		)
@@ -1046,50 +1543,15 @@ func recoverProcessingQueue(
 		job.FinishedAt = nil
 		job.DurationMS = 0
 		job.Output = ""
-		job.Error = "recovered after worker failure"
+		job.Error = ""
+		job.LastError = "recovered after worker failure"
 
-		if err := saveJob(job); err != nil {
-			log.Println(
-				"failed updating recovered",
-				jobID,
-				":",
-				err,
-			)
-
+		if err := persistAndMove(job, processingKey, targetQueue, "taskgrid:metrics:job_recoveries_total"); err != nil {
+			log.Printf("failed recovering %s: %v", jobID, err)
 			continue
 		}
 
-		moved, err := requeueScript.Run(
-			ctx,
-			rdb,
-			[]string{
-				processingKey,
-				targetQueue,
-			},
-			jobID,
-		).Int()
-
-		if err != nil {
-			log.Println(
-				"failed recovering",
-				jobID,
-				":",
-				err,
-			)
-
-			continue
-		}
-
-		if moved == 1 {
-			log.Println(
-				"recovered",
-				jobID,
-				"from dead worker",
-				workerID,
-				"back to",
-				targetQueue,
-			)
-		}
+		log.Printf("recovered %s from dead worker %s back to %s", jobID, workerID, targetQueue)
 	}
 }
 
@@ -1141,13 +1603,9 @@ func worker(
 	workerID string,
 	workerType string,
 ) {
-	workerType = strings.ToLower(
-		strings.TrimSpace(workerType),
-	)
-
+	workerType = strings.ToLower(strings.TrimSpace(workerType))
 	switch workerType {
 	case "cpu", "io", "general":
-
 	default:
 		workerType = "general"
 	}
@@ -1156,110 +1614,49 @@ func worker(
 	startRecoveryLoop()
 
 	queue := jobQueueFor(workerType)
-
-	processingQueue := processingPrefix +
-		workerID
-
-	log.Println(
-		workerID,
-		"started as",
-		workerType,
-		"worker and is waiting on",
-		queue,
-	)
+	processingQueue := processingPrefix + workerID
+	log.Printf("%s started as %s worker and is waiting on %s", workerID, workerType, queue)
 
 	for {
-		jobID, err := rdb.BRPopLPush(
-			ctx,
-			queue,
-			processingQueue,
-			0,
-		).Result()
-
+		jobID, err := rdb.BRPopLPush(ctx, queue, processingQueue, 0).Result()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Println(
-				workerID,
-				"Redis error:",
-				err,
-			)
-
+			log.Printf("%s Redis error: %v", workerID, err)
 			continue
 		}
 
-		log.Println(
-			workerID,
-			"received",
-			jobID,
-		)
-
+		log.Printf("%s received %s", workerID, jobID)
 		job, err := loadJob(jobID)
-
 		if err != nil {
-			log.Println(
-				workerID,
-				"failed to load",
-				jobID,
-				":",
-				err,
-			)
-
-			rdb.LRem(
-				ctx,
-				processingQueue,
-				1,
-				jobID,
-			)
-
+			log.Printf("%s failed to load %s: %v", workerID, jobID, err)
+			_ = rdb.LRem(ctx, processingQueue, 1, jobID).Err()
 			continue
+		}
+		if job.MaxAttempts <= 0 {
+			job.MaxAttempts = maxAttempts()
 		}
 
 		job.Status = "RUNNING"
 		job.WorkerID = workerID
 		job.Output = ""
+		job.OutputTruncated = false
 		job.Error = ""
 		job.FinishedAt = nil
 		job.DurationMS = 0
 		job.Attempts++
-
 		startedAt := time.Now().UTC()
-
 		job.StartedAt = &startedAt
 
 		if err := saveJob(job); err != nil {
-			log.Println(
-				workerID,
-				"failed to save",
-				jobID,
-				":",
-				err,
-			)
-
-			requeueClaimedJob(
-				processingQueue,
-				queue,
-				jobID,
-			)
-
+			log.Printf("%s failed to mark %s running: %v", workerID, jobID, err)
+			requeueClaimedJob(processingQueue, queue, jobID)
 			continue
 		}
 
-		log.Println(
-			workerID,
-			"is running",
-			jobID,
-			"type",
-			job.WorkloadType,
-			"attempt",
-			job.Attempts,
-		)
-
-		commandCtx, cancel := context.WithTimeout(
-			ctx,
-			30*time.Second,
-		)
+		log.Printf("%s is running %s type=%s attempt=%d/%d", workerID, jobID, job.WorkloadType, job.Attempts, job.MaxAttempts)
+		commandCtx, commandCancel := context.WithTimeout(ctx, jobTimeout())
 
 		var cmd *exec.Cmd
 		if shellCommandsAllowed() {
@@ -1267,92 +1664,99 @@ func worker(
 		} else {
 			executable, args, parseErr := parseCommand(job.Command)
 			if parseErr != nil {
-				job.Status = "FAILED"
-				job.Error = "invalid command: " + parseErr.Error()
-				job.FinishedAt = &startedAt
-				job.DurationMS = 0
-				_ = saveJob(job)
-				_ = rdb.LRem(ctx, processingQueue, 1, jobID).Err()
-				jobsFailed.Add(1)
+				commandCancel()
+				failure := "invalid command: " + parseErr.Error()
+				if err := deadLetterJob(&job, processingQueue, failure); err != nil {
+					log.Printf("%s failed to dead-letter %s: %v", workerID, jobID, err)
+				}
 				continue
 			}
 			cmd = exec.CommandContext(commandCtx, executable, args...)
 		}
 
-		output, commandErr := cmd.CombinedOutput()
+		output := &limitedBuffer{limit: maxOutputBytes()}
+		cmd.Stdout = output
+		cmd.Stderr = output
+		commandErr := cmd.Run()
+		timedOut := errors.Is(commandCtx.Err(), context.DeadlineExceeded)
+		shutdown := ctx.Err() != nil
+		commandCancel()
+		if shutdown {
+			log.Printf("%s stopping with %s still claimed for recovery", workerID, jobID)
+			return
+		}
 
-		timedOut := commandCtx.Err() ==
-			context.DeadlineExceeded
-
-		cancel()
-
-		job.Output = string(output)
-
+		job.Output = output.String()
+		job.OutputTruncated = output.truncated
 		finishedAt := time.Now().UTC()
-
 		job.FinishedAt = &finishedAt
-
-		job.DurationMS = finishedAt.
-			Sub(*job.StartedAt).
-			Milliseconds()
+		job.DurationMS = finishedAt.Sub(*job.StartedAt).Milliseconds()
 
 		if timedOut {
-			job.Status = "FAILED"
-			job.Error = "command timed out after 30 seconds"
-			jobsFailed.Add(1)
-
-		} else if commandErr != nil {
-			job.Status = "FAILED"
-			job.Error = commandErr.Error()
-			jobsFailed.Add(1)
-
-		} else {
-			job.Status = "SUCCEEDED"
-			job.Error = ""
-			jobsSucceeded.Add(1)
+			failure := fmt.Sprintf("command timed out after %s", jobTimeout())
+			handleRetryOrDeadLetter(&job, processingQueue, queue, failure)
+			continue
 		}
-
-		if err := saveJob(job); err != nil {
-			log.Println(
-				workerID,
-				"failed to save completed job",
-				jobID,
-				":",
-				err,
-			)
-
+		if commandErr != nil {
+			handleRetryOrDeadLetter(&job, processingQueue, queue, commandErr.Error())
 			continue
 		}
 
-		if err := rdb.LRem(
-			ctx,
-			processingQueue,
-			1,
-			jobID,
-		).Err(); err != nil {
-
-			log.Println(
-				workerID,
-				"failed to acknowledge",
-				jobID,
-				":",
-				err,
-			)
-
+		job.Status = "SUCCEEDED"
+		job.Error = ""
+		job.LastError = ""
+		if err := persistAndMove(job, processingQueue, "", "taskgrid:metrics:jobs_succeeded_total"); err != nil {
+			log.Printf("%s failed to finalize %s: %v", workerID, jobID, err)
 			continue
 		}
-
-		log.Println(
-			workerID,
-			"finished",
-			jobID,
-			"with status",
-			job.Status,
-		)
+		log.Printf("%s finished %s with status %s", workerID, jobID, job.Status)
 	}
 }
 
+func handleRetryOrDeadLetter(job *Job, processingQueue, queue, failure string) {
+	job.LastError = failure
+	if job.Attempts < job.MaxAttempts {
+		job.Status = "QUEUED"
+		job.Error = ""
+		job.WorkerID = ""
+		job.StartedAt = nil
+		job.FinishedAt = nil
+		job.DurationMS = 0
+		if err := persistAndMove(*job, processingQueue, queue, "taskgrid:metrics:job_retries_total"); err != nil {
+			log.Printf("failed to requeue %s after attempt %d: %v", job.ID, job.Attempts, err)
+			return
+		}
+		log.Printf("requeued %s after attempt %d/%d", job.ID, job.Attempts, job.MaxAttempts)
+		return
+	}
+
+	if err := deadLetterJob(job, processingQueue, failure); err != nil {
+		log.Printf("failed to dead-letter %s: %v", job.ID, err)
+	}
+}
+
+func deadLetterJob(job *Job, processingQueue, failure string) error {
+	finishedAt := time.Now().UTC()
+	job.Status = "FAILED"
+	job.Error = failure
+	job.LastError = failure
+	job.FinishedAt = &finishedAt
+	if job.StartedAt != nil {
+		job.DurationMS = finishedAt.Sub(*job.StartedAt).Milliseconds()
+	}
+	return persistAndMove(*job, processingQueue, deadLetterQueue, "taskgrid:metrics:jobs_failed_total")
+}
+
 func startAPI() {
+	if err := validateAuthConfig(); err != nil {
+		log.Fatal("invalid API authentication configuration: ", err)
+	}
+	if mode := schedulerMode(); mode != "ai" && mode != "hybrid" && mode != "rules" {
+		log.Fatalf("invalid TASKGRID_SCHEDULER_MODE %q", mode)
+	}
+	// Keep recovery active even when KEDA has scaled every worker pool to zero.
+	startRecoveryLoop()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/readyz", readyHandler)
@@ -1368,6 +1772,7 @@ func startAPI() {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
 	}
 
 	shutdown := make(chan os.Signal, 1)
@@ -1393,7 +1798,17 @@ func startAPI() {
 	}
 }
 
+func installCancellationSignal() {
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-shutdown
+		cancel()
+	}()
+}
+
 func main() {
+	installCancellationSignal()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatal(
 			"could not connect to Redis:",

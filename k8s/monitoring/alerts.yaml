@@ -1,0 +1,50 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taskgrid-alerts
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: taskgrid
+      rules:
+        - alert: TaskGridAPIUnavailable
+          expr: absent(up{service="taskgrid-api"} == 1)
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: TaskGrid API is unavailable
+            description: Prometheus has not observed a healthy TaskGrid API target for two minutes.
+        - alert: TaskGridQueueBacklog
+          expr: sum(max by (queue) (taskgrid_queue_depth{queue=~"cpu|io|general"})) > 50
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: TaskGrid has a sustained queue backlog
+            description: More than 50 jobs have remained queued for five minutes.
+        - alert: TaskGridRedisUnavailable
+          expr: min(taskgrid_redis_up) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: TaskGrid cannot reach Redis
+            description: At least one TaskGrid API instance has reported Redis unavailable for two minutes.
+        - alert: TaskGridDeadLettersPresent
+          expr: max(taskgrid_queue_depth{queue="dead_letter"}) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: TaskGrid has dead-lettered jobs
+            description: At least one job exhausted its retry policy and requires inspection.
+        - alert: TaskGridHighServerErrorRate
+          expr: sum(rate(taskgrid_http_responses_total{class="5xx"}[5m])) / clamp_min(sum(rate(taskgrid_http_requests_total[5m])), 0.001) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: TaskGrid server error rate is above 5%
+            description: More than 5% of API requests have returned 5xx responses for five minutes.

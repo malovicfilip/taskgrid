@@ -1,4 +1,8 @@
 /taskgrid
+/taskgrid.exe
+/loadtest
+/loadtest.exe
+/artifacts/
 .env
 .env.*
 *.key

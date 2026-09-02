@@ -1,4 +1,4 @@
-module github.com/filipmalovic/taskgrid
+module github.com/malovicfilip/taskgrid
 
 go 1.27.0
 

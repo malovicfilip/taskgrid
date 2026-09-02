@@ -1,81 +1,135 @@
 apiVersion: apps/v1
 kind: Deployment
-
 metadata:
   name: taskgrid-api
-
 spec:
-  replicas: 1
-
+  replicas: 2
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: taskgrid-api
-
   template:
     metadata:
       labels:
         app: taskgrid-api
-
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
     spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: taskgrid-api
           image: taskgrid:latest
-          imagePullPolicy: Never
-
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8080
-
+            - name: http
+              containerPort: 8080
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8080
+              port: http
             initialDelaySeconds: 3
             periodSeconds: 5
-
+            timeoutSeconds: 2
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 10
-
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           env:
             - name: TASKGRID_MODE
-              value: "api"
-
+              value: api
             - name: REDIS_ADDR
-              value: "redis:6379"
-
+              value: redis:6379
             - name: GROQ_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: taskgrid-ai
                   key: GROQ_API_KEY
-              
-
+                  optional: true
             - name: GROQ_MODEL
-              value: "openai/gpt-oss-20b"
-
+              value: openai/gpt-oss-20b
+            - name: TASKGRID_SCHEDULER_MODE
+              value: hybrid
+            - name: TASKGRID_REQUIRE_AUTH
+              value: "true"
             - name: TASKGRID_API_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: taskgrid-ai
                   key: TASKGRID_API_TOKEN
                   optional: true
-
-            
-
+            - name: TASKGRID_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: taskgrid-ai
+                  key: TASKGRID_ADMIN_TOKEN
+                  optional: true
+            - name: TASKGRID_SUBMIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: taskgrid-ai
+                  key: TASKGRID_SUBMIT_TOKEN
+                  optional: true
+            - name: TASKGRID_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: taskgrid-ai
+                  key: TASKGRID_READ_TOKEN
+                  optional: true
+            - name: TASKGRID_JOB_RETENTION_HOURS
+              value: "168"
+            - name: TASKGRID_RATE_LIMIT_PER_MINUTE
+              value: "600"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
-
 metadata:
   name: taskgrid-api
-
+  labels:
+    app: taskgrid-api
 spec:
   selector:
     app: taskgrid-api
-
   ports:
-    - port: 8080
-      targetPort: 8080
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: taskgrid-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: taskgrid-api
