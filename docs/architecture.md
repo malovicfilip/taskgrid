@@ -34,11 +34,13 @@ flowchart LR
    duplicate AI calls on client retries.
 3. The hybrid scheduler asks Groq for a validated classification and falls back
    to deterministic rules if the provider is unavailable. Rules-only mode
-   supports explicit workload hints for repeatable, no-cost benchmarks.
+   supports explicit workload hints for repeatable, no-cost benchmarks. AI and
+   hybrid modes send the job name, description, and command to Groq.
 4. One Redis Lua script writes the job, indexes it, pushes it to the selected
    queue, and records the idempotency mapping atomically.
 5. A worker atomically moves the job from its queue to a worker-specific
-   processing list before execution.
+   processing list before execution. Every later state transition verifies that
+   processing-list claim before updating the stored job.
 6. Heartbeats allow another worker to recover a claim after a worker failure.
 7. Completion, retry, acknowledgement, and dead-letter transitions are performed
    with Redis scripts so job state and queue state do not drift apart.

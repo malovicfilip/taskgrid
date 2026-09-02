@@ -4,3 +4,4 @@ resources:
   - redis.yaml
   - api.yaml
   - worker-pools.yaml
+  - production/redis-networkpolicy.yaml

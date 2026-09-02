@@ -9,9 +9,12 @@ workloads, not arbitrary public users.
 - Constant-time bearer-token comparison.
 - Separate admin, submit-only, and read-only tokens, with legacy admin-token
   compatibility.
-- Fail-closed production configuration through TASKGRID_REQUIRE_AUTH.
-- Direct process execution by default; shell evaluation is opt-in.
-- Optional executable allowlist.
+- Fail-closed authentication by default. Only an explicit
+  TASKGRID_REQUIRE_AUTH=false permits startup without a token.
+- Direct process execution uses a required executable allowlist. An empty
+  TASKGRID_ALLOWED_COMMANDS value disables command execution.
+- Shell evaluation is a separate opt-in and also requires bash to be explicitly
+  present in TASKGRID_ALLOWED_COMMANDS.
 - Request-body and field-size limits.
 - Redis-backed per-credential rate limiting.
 - Execution timeout and bounded captured output.
@@ -32,7 +35,26 @@ workloads, not arbitrary public users.
   A managed Redis service with TLS and authentication is recommended in cloud
   deployments.
 - Jobs use at-least-once delivery. External side effects must be idempotent.
-- Shell mode must remain disabled for untrusted submissions.
+- Workers are not a sandbox for arbitrary untrusted code. Non-root containers,
+  seccomp, dropped capabilities, timeouts, and an allowlist reduce risk but do
+  not make a hostile executable safe. Only trusted callers may submit jobs, and
+  shell mode must remain disabled for untrusted submissions.
+
+## AI data disclosure
+
+In `ai` and `hybrid` scheduler modes, TaskGrid sends the submitted job name,
+description, and command over HTTPS to the configured Groq model for workload
+classification. Groq responses are capped at 64 KiB before JSON parsing. Use
+`TASKGRID_SCHEDULER_MODE=rules` when job metadata must not leave the deployment;
+rules mode makes no Groq request.
+
+## Public operational endpoints
+
+`/health`, `/readyz`, and `/metrics` are intentionally unauthenticated so
+Kubernetes probes and Prometheus can reach them without a TaskGrid bearer token.
+They do not return job payloads, but readiness and aggregate metrics still
+reveal operational information. Internet-facing deployments must restrict these
+paths using an ingress, firewall, or private monitoring network.
 
 ## Secret handling
 

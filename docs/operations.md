@@ -7,6 +7,9 @@
 - /readyz proves the API can currently reach Redis.
 - /metrics exposes request, latency, scheduling, retry, completion, dead-letter,
   and queue-depth metrics.
+- These three operational endpoints intentionally bypass bearer authentication
+  for Kubernetes and Prometheus. Restrict them at the network edge in any
+  internet-facing deployment.
 - API logs are JSON audit records for each request. Worker logs include job ID,
   pool, attempt, recovery, and final state.
 

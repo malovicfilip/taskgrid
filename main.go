@@ -92,15 +92,44 @@ var (
 )
 
 const (
-	cpuQueue          = "taskgrid:jobs:cpu"
-	ioQueue           = "taskgrid:jobs:io"
-	generalQueue      = "taskgrid:jobs:general"
-	processingPrefix  = "taskgrid:processing:"
-	heartbeatPrefix   = "taskgrid:heartbeat:"
-	jobKeyPrefix      = "taskgrid:job:"
-	idempotencyPrefix = "taskgrid:idempotency:"
-	jobIndexKey       = "taskgrid:jobs:index"
-	deadLetterQueue   = "taskgrid:jobs:dead"
+	cpuQueue             = "taskgrid:jobs:cpu"
+	ioQueue              = "taskgrid:jobs:io"
+	generalQueue         = "taskgrid:jobs:general"
+	processingPrefix     = "taskgrid:processing:"
+	heartbeatPrefix      = "taskgrid:heartbeat:"
+	jobKeyPrefix         = "taskgrid:job:"
+	idempotencyPrefix    = "taskgrid:idempotency:"
+	jobIndexKey          = "taskgrid:jobs:index"
+	deadLetterQueue      = "taskgrid:jobs:dead"
+	maxGroqResponseBytes = 64 * 1024
+
+	persistClaimedJobLua = `
+		local claim_position = redis.call("LPOS", KEYS[2], ARGV[3])
+		if claim_position == false then
+			return 0
+		end
+		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+		return 1
+	`
+
+	persistAndMoveLua = `
+		local claim_position = redis.call("LPOS", KEYS[2], ARGV[3])
+		if claim_position == false then
+			return 0
+		end
+		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+		local removed = redis.call("LREM", KEYS[2], 1, ARGV[3])
+		if removed ~= 1 then
+			return 0
+		end
+		if KEYS[3] ~= "" then
+			redis.call("LPUSH", KEYS[3], ARGV[3])
+		end
+		if KEYS[4] ~= "" then
+			redis.call("INCR", KEYS[4])
+		end
+		return 1
+	`
 )
 
 type contextKey string
@@ -219,10 +248,18 @@ func readToken() string {
 }
 
 func authRequired() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("TASKGRID_REQUIRE_AUTH")), "true")
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv("TASKGRID_REQUIRE_AUTH")), "false")
 }
 
 func validateAuthConfig() error {
+	requireAuthValue := strings.TrimSpace(os.Getenv("TASKGRID_REQUIRE_AUTH"))
+	if requireAuthValue != "" &&
+		!strings.EqualFold(requireAuthValue, "true") &&
+		!strings.EqualFold(requireAuthValue, "false") {
+
+		return errors.New("TASKGRID_REQUIRE_AUTH must be true or false")
+	}
+
 	tokens := map[string]string{
 		"legacy-admin": strings.TrimSpace(apiToken()),
 		"admin":        adminToken(),
@@ -249,6 +286,21 @@ func shellCommandsAllowed() bool {
 	return strings.EqualFold(os.Getenv("TASKGRID_ALLOW_SHELL_COMMANDS"), "true")
 }
 
+func validateExecutableAllowed(executable string) error {
+	allowedValue := strings.TrimSpace(os.Getenv("TASKGRID_ALLOWED_COMMANDS"))
+	if allowedValue == "" {
+		return errors.New("command execution is disabled because TASKGRID_ALLOWED_COMMANDS is empty")
+	}
+
+	for _, candidate := range strings.Split(allowedValue, ",") {
+		if strings.EqualFold(strings.TrimSpace(candidate), executable) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("executable %q is not in TASKGRID_ALLOWED_COMMANDS", executable)
+}
+
 func parseCommand(command string) (string, []string, error) {
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
@@ -256,18 +308,8 @@ func parseCommand(command string) (string, []string, error) {
 	}
 
 	executable := parts[0]
-	allowedValue := strings.TrimSpace(os.Getenv("TASKGRID_ALLOWED_COMMANDS"))
-	if allowedValue != "" {
-		allowed := false
-		for _, candidate := range strings.Split(allowedValue, ",") {
-			if strings.EqualFold(strings.TrimSpace(candidate), executable) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return "", nil, fmt.Errorf("executable %q is not in TASKGRID_ALLOWED_COMMANDS", executable)
-		}
+	if err := validateExecutableAllowed(executable); err != nil {
+		return "", nil, err
 	}
 
 	return executable, parts[1:], nil
@@ -470,17 +512,7 @@ func persistAndMove(job Job, processingQueue, targetQueue, metricKey string) err
 		return err
 	}
 
-	script := redis.NewScript(`
-		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
-		local removed = redis.call("LREM", KEYS[2], 1, ARGV[3])
-		if removed == 1 and KEYS[3] ~= "" then
-			redis.call("LPUSH", KEYS[3], ARGV[3])
-		end
-		if KEYS[4] ~= "" then
-			redis.call("INCR", KEYS[4])
-		end
-		return removed
-	`)
+	script := redis.NewScript(persistAndMoveLua)
 
 	moved, err := script.Run(ctx, rdb, []string{
 		jobKeyPrefix + job.ID,
@@ -495,6 +527,41 @@ func persistAndMove(job Job, processingQueue, targetQueue, metricKey string) err
 		return fmt.Errorf("job %s was not present in processing queue %s", job.ID, processingQueue)
 	}
 	return nil
+}
+
+func persistClaimedJob(job Job, processingQueue string) error {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+
+	claimed, err := redis.NewScript(persistClaimedJobLua).Run(ctx, rdb, []string{
+		jobKeyPrefix + job.ID,
+		processingQueue,
+	}, string(data), int64(jobRetention().Seconds()), job.ID).Int()
+	if err != nil {
+		return err
+	}
+	if claimed != 1 {
+		return fmt.Errorf("job %s is no longer claimed in processing queue %s", job.ID, processingQueue)
+	}
+	return nil
+}
+
+func decodeGroqResponse(body io.Reader) (GroqResponse, error) {
+	data, err := io.ReadAll(io.LimitReader(body, int64(maxGroqResponseBytes)+1))
+	if err != nil {
+		return GroqResponse{}, err
+	}
+	if len(data) > maxGroqResponseBytes {
+		return GroqResponse{}, fmt.Errorf("Groq response exceeds %d-byte limit", maxGroqResponseBytes)
+	}
+
+	var response GroqResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return GroqResponse{}, err
+	}
+	return response, nil
 }
 
 func scheduleWithAI(req ScheduleRequest) (SchedulingDecision, error) {
@@ -633,11 +700,8 @@ Return only JSON using exactly this structure:
 			)
 	}
 
-	var groqResponse GroqResponse
-
-	if err := json.NewDecoder(
-		resp.Body,
-	).Decode(&groqResponse); err != nil {
+	groqResponse, err := decodeGroqResponse(resp.Body)
+	if err != nil {
 		return SchedulingDecision{}, err
 	}
 
@@ -799,8 +863,14 @@ func withAPIProtection(next http.Handler) http.Handler {
 		} else {
 			configured := apiToken() != "" || adminToken() != "" || submitToken() != "" || readToken() != ""
 			if !configured {
+				if authRequired() {
+					authFailures.Add(1)
+					http.Error(recorder, "authentication is required but no API token is configured", http.StatusServiceUnavailable)
+					finishRequest(recorder, r, requestID, role, started)
+					return
+				}
 				authDisabledNotice.Do(func() {
-					log.Println("WARNING: no TaskGrid API tokens are configured; authentication is disabled")
+					log.Println("WARNING: TASKGRID_REQUIRE_AUTH=false; authentication is explicitly disabled")
 				})
 				role = "admin"
 			} else {
@@ -1649,7 +1719,7 @@ func worker(
 		startedAt := time.Now().UTC()
 		job.StartedAt = &startedAt
 
-		if err := saveJob(job); err != nil {
+		if err := persistClaimedJob(job, processingQueue); err != nil {
 			log.Printf("%s failed to mark %s running: %v", workerID, jobID, err)
 			requeueClaimedJob(processingQueue, queue, jobID)
 			continue
@@ -1660,6 +1730,14 @@ func worker(
 
 		var cmd *exec.Cmd
 		if shellCommandsAllowed() {
+			if allowErr := validateExecutableAllowed("bash"); allowErr != nil {
+				commandCancel()
+				failure := "invalid command: shell mode requires bash in TASKGRID_ALLOWED_COMMANDS: " + allowErr.Error()
+				if err := deadLetterJob(&job, processingQueue, failure); err != nil {
+					log.Printf("%s failed to dead-letter %s: %v", workerID, jobID, err)
+				}
+				continue
+			}
 			cmd = exec.CommandContext(commandCtx, "bash", "-lc", job.Command)
 		} else {
 			executable, args, parseErr := parseCommand(job.Command)

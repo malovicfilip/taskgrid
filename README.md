@@ -113,6 +113,11 @@ TASKGRID_API_TOKEN remains backward-compatible as an admin token. Production
 deployments should use distinct TASKGRID_ADMIN_TOKEN, TASKGRID_SUBMIT_TOKEN, and
 TASKGRID_READ_TOKEN values.
 
+Authentication fails closed when `TASKGRID_REQUIRE_AUTH` is unset. Set it to
+`false` explicitly only for isolated local development. `/health`, `/readyz`,
+and `/metrics` intentionally remain unauthenticated for orchestrator and
+Prometheus access; restrict them at the network edge when deploying publicly.
+
 ## Kubernetes and KEDA
 
 Requirements: Docker Desktop, kubectl, kind, and Helm.
@@ -136,14 +141,9 @@ kubectl rollout status deployment/taskgrid-api
 kubectl port-forward service/taskgrid-api 8080:8080
 ~~~
 
-The Kustomize entry point contains only the supported API, Redis, and three
-KEDA-managed worker-pool resources.
-
-The optional production Redis NetworkPolicy is applied separately:
-
-~~~powershell
-kubectl apply -f k8s/production/redis-networkpolicy.yaml
-~~~
+The Kustomize entry point contains the supported API, Redis, three KEDA-managed
+worker pools, and the Redis ingress NetworkPolicy. The policy is enforced when
+the cluster uses a NetworkPolicy-capable CNI.
 
 ## Monitoring
 
@@ -195,9 +195,9 @@ SLA; the full methodology and percentiles are in
 | TASKGRID_ADMIN_TOKEN | empty | Full-access credential |
 | TASKGRID_SUBMIT_TOKEN | empty | Job-submission credential |
 | TASKGRID_READ_TOKEN | empty | Job-read credential |
-| TASKGRID_REQUIRE_AUTH | false | Refuse API startup when no token exists |
-| TASKGRID_ALLOW_SHELL_COMMANDS | false | Opt into shell evaluation |
-| TASKGRID_ALLOWED_COMMANDS | empty | Comma-separated direct-execution allowlist |
+| TASKGRID_REQUIRE_AUTH | true | Refuse API startup when no token exists; only explicit false disables auth |
+| TASKGRID_ALLOW_SHELL_COMMANDS | false | Opt into shell evaluation; also requires bash in the executable allowlist |
+| TASKGRID_ALLOWED_COMMANDS | empty | Comma-separated executable allowlist; empty disables command execution |
 | TASKGRID_MAX_ATTEMPTS | 3 | Total execution attempts |
 | TASKGRID_JOB_TIMEOUT_SECONDS | 30 | Per-attempt execution deadline |
 | TASKGRID_MAX_OUTPUT_BYTES | 65536 | Captured stdout/stderr limit |
